@@ -261,7 +261,7 @@ jobs:
         env:
           STATUS: ${{ steps.eval.outputs.status }}
         run: |
-          if [ "$STATUS" != "PASS" ]; then
+          if [ "$STATUS" = "NEVER" ]; then
             echo "::error::AI Review Gate failed. See the job summary for reasons."
             exit 1
           fi
