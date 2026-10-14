@@ -1,0 +1,9 @@
+# The review system itself is owned by the Team Lead.
+# A PR touching any of these needs the lead's approval (ruleset: require code owner review).
+# bootstrap-repo.sh replaces @TEAM_LEAD with your GitHub username.
+
+/.github/                 @TEAM_LEAD
+/.claude/                 @TEAM_LEAD
+/CLAUDE.md                @TEAM_LEAD
+/.specify/memory/         @TEAM_LEAD
+/scripts/                 @TEAM_LEAD

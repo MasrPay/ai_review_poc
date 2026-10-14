@@ -1,0 +1,12 @@
+name: ai_review_poc
+description: Synthetic FinTech code for the AI PR review proof of concept.
+publish_to: none
+
+environment:
+  sdk: ^3.5.0
+dev_dependencies:
+  lints: ^5.1.1
+  test: ^1.31.0
+
+# Dev dependencies are added in docs/SETUP.md step 3.3:
+#   dart pub add --dev lints test

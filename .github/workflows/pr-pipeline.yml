@@ -1,0 +1,268 @@
+name: PR Pipeline
+
+# Runs on every PR targeting a protected branch.
+# Order: cheap deterministic checks first, AI review only if they all pass,
+# then a deterministic gate that FAILS CLOSED.
+#
+# Uses `pull_request` (never `pull_request_target`): fork PRs get no secrets,
+# so the AI step is skipped for forks and the gate fails closed.
+
+on:
+  pull_request:
+    branches: [main, develop]
+    types: [opened, synchronize, reopened, ready_for_review]
+
+# Deny everything by default; each job asks only for what it needs.
+permissions: {}
+
+concurrency:
+  group: pr-pipeline-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------- 1. policy
+  policy:
+    name: Policy Checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Spec link, sensitive files, protected paths, story ID
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          STORY_ID_REGEX: ${{ vars.STORY_ID_REGEX }}
+        run: bash scripts/policy-check.sh
+
+  # -------------------------------------------------------------------- 2. CI
+  # The only stack-specific job. Swap these steps per project.
+  ci:
+    name: CI
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dart-lang/setup-dart@6afc89df92d6eb3834022f73cd65adc8cdfcb92d # v1.8.1
+        with:
+          sdk: stable
+      - name: Install dependencies
+        run: dart pub get
+      - name: Format check
+        run: dart format --output=none --set-exit-if-changed .
+      - name: Static analysis
+        run: dart analyze --fatal-infos
+      - name: Tests
+        run: dart test
+
+  # ----------------------------------------------------------- 3. secret scan
+  secrets:
+    name: Secret Scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    env:
+      GITLEAKS_VERSION: "8.30.1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install gitleaks (checksum verified)
+        run: |
+          set -euo pipefail
+          base="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}"
+          tarball="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -fsSLO "${base}/${tarball}"
+          curl -fsSLO "${base}/gitleaks_${GITLEAKS_VERSION}_checksums.txt"
+          grep " ${tarball}\$" "gitleaks_${GITLEAKS_VERSION}_checksums.txt" | sha256sum -c -
+          tar -xzf "${tarball}" gitleaks
+          sudo install -m 0755 gitleaks /usr/local/bin/gitleaks
+      - name: Scan commits in this PR
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: gitleaks git --redact --no-banner --exit-code 1 --log-opts="${BASE_SHA}..${HEAD_SHA}" .
+
+  # ------------------------------------------------------------- 4. AI review
+  ai-review:
+    name: AI Review
+    needs: [policy, ci, secrets]
+    # Same-repo, non-draft PRs only. Forks never reach the API key.
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Uses the repo's own GITHUB_TOKEN instead of the Claude GitHub App token.
+    # The repo setting "Allow GitHub Actions to approve PRs" is OFF, so this
+    # token can comment but can never submit an APPROVE review, and without
+    # contents:write it can't push or merge.
+    permissions:
+      contents: read        # read the code
+      pull-requests: write  # post inline review comments
+      issues: read          # read PR conversation
+    outputs:
+      result: ${{ steps.review.outputs.structured_output }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Claude review
+        id: review
+        uses: anthropics/claude-code-action@34968b5981d5d170904281aa3df6f3c0d4a28855 # v1.0.249
+        with:
+          # POC: runs on your Claude subscription (token from `claude setup-token`).
+          # Later, for team rollout, switch to: anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ github.token }}
+          prompt: >-
+            /pr-review
+            PR=${{ github.event.pull_request.number }}
+            BASE=${{ github.event.pull_request.base.sha }}
+            HEAD=${{ github.event.pull_request.head.sha }}
+          claude_args: |
+            --model claude-sonnet-5-5
+            --max-turns 30
+            --allowedTools "Read,Grep,Glob,Bash(git diff:*),Bash(git log:*),Bash(git show:*),mcp__github_inline_comment__create_inline_comment"
+            --json-schema '{"type":"object","additionalProperties":false,"required":["verdict","blockers","majors","minors","spec_coverage","summary"],"properties":{"verdict":{"type":"string","enum":["approve","request_changes"]},"blockers":{"type":"integer","minimum":0},"majors":{"type":"integer","minimum":0},"minors":{"type":"integer","minimum":0},"spec_coverage":{"type":"string","enum":["full","partial","none","not_applicable"]},"summary":{"type":"string","maxLength":2000}}}'
+
+  # ------------------------------------------------------------------ 5. gate
+  # Deterministic. No AI, no API key. This is the required status check.
+  gate:
+    name: AI Review Gate
+    needs: [policy, ci, secrets, ai-review]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: write  # only to set the ai-gate:pass / ai-gate:fail label
+    steps:
+      - name: Evaluate (fail closed)
+        id: eval
+        env:
+          POLICY: ${{ needs.policy.result }}
+          CI: ${{ needs.ci.result }}
+          SECRETS: ${{ needs.secrets.result }}
+          AI_JOB: ${{ needs.ai-review.result }}
+          AI_RESULT: ${{ needs.ai-review.outputs.result }}
+        run: |
+          set -uo pipefail
+          reasons=()
+          [ "$POLICY"  = "success" ] || reasons+=("Policy Checks: $POLICY")
+          [ "$CI"      = "success" ] || reasons+=("CI: $CI")
+          [ "$SECRETS" = "success" ] || reasons+=("Secret Scan: $SECRETS")
+          [ "$AI_JOB"  = "success" ] || reasons+=("AI Review job: $AI_JOB")
+
+          verdict="missing"; blockers="?"; majors="?"; minors="?"; coverage="?"; summary=""
+          if [ -n "${AI_RESULT:-}" ] && echo "$AI_RESULT" | jq -e 'type == "object"' >/dev/null 2>&1; then
+            verdict=$(echo "$AI_RESULT"  | jq -r '.verdict // "missing"')
+            blockers=$(echo "$AI_RESULT" | jq -r '.blockers // "?"')
+            majors=$(echo "$AI_RESULT"   | jq -r '.majors // "?"')
+            minors=$(echo "$AI_RESULT"   | jq -r '.minors // "?"')
+            coverage=$(echo "$AI_RESULT" | jq -r '.spec_coverage // "?"')
+            # Strip backticks and '#' so PR-influenced text can't break out of the code block.
+            summary=$(echo "$AI_RESULT"  | jq -r '.summary // ""' | tr -d '`#')
+          else
+            reasons+=("AI result missing or not valid JSON")
+          fi
+
+          [ "$verdict" = "approve" ] || reasons+=("AI verdict: $verdict")
+          [ "$blockers" = "0" ] || reasons+=("Blocker findings: $blockers")
+          [ "$majors" = "0" ]   || reasons+=("Major findings: $majors")
+          case "$coverage" in full|not_applicable) ;; *) reasons+=("Spec coverage: $coverage");; esac
+
+          if [ ${#reasons[@]} -eq 0 ]; then status="PASS"; else status="FAIL"; fi
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## AI Review Gate: $status"
+            echo
+            echo "| Check | Result |"
+            echo "|---|---|"
+            echo "| Policy Checks | $POLICY |"
+            echo "| CI | $CI |"
+            echo "| Secret Scan | $SECRETS |"
+            echo "| AI Review job | $AI_JOB |"
+            echo "| AI verdict | $verdict |"
+            echo "| Blockers / Majors / Minors | $blockers / $majors / $minors |"
+            echo "| Spec coverage | $coverage |"
+            echo
+            if [ "$status" = "FAIL" ]; then
+              echo "### Why it failed"
+              for r in "${reasons[@]}"; do echo "- $r"; done
+              echo
+            fi
+            echo "### AI summary (advisory, not authoritative)"
+            echo
+            echo '```text'
+            echo "${summary:-none}"
+            echo '```'
+            echo
+            echo "_This gate is a status check, not a GitHub approval. A human approval is still required to merge._"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Skipped when this run was superseded, so an old run can't overwrite a newer label.
+      - name: Label PR with gate result
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          STATUS: ${{ steps.eval.outputs.status }}
+        run: |
+          # rm is URL-encoded (":" -> %3A) because it goes into the URL path.
+          if [ "$STATUS" = "PASS" ]; then add="ai-gate:pass"; rm="ai-gate%3Afail"; else add="ai-gate:fail"; rm="ai-gate%3Apass"; fi
+          gh api -X DELETE "repos/$GH_REPO/issues/$PR/labels/$rm" >/dev/null 2>&1 || true
+          gh api -X POST "repos/$GH_REPO/issues/$PR/labels" -f "labels[]=$add" >/dev/null \
+            || echo "::warning::Could not update labels"
+
+      - name: Notify Microsoft Teams (optional)
+        if: ${{ !cancelled() }}
+        env:
+          TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
+          STATUS: ${{ steps.eval.outputs.status }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          [ -n "${TEAMS_WEBHOOK_URL:-}" ] || { echo "Teams webhook not configured; skipping."; exit 0; }
+          payload=$(jq -n --arg s "$STATUS" --arg t "$PR_TITLE" --arg u "$PR_URL" '{
+            type: "message",
+            attachments: [{
+              contentType: "application/vnd.microsoft.card.adaptive",
+              content: {
+                "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                type: "AdaptiveCard", version: "1.4",
+                body: [
+                  {type: "TextBlock", weight: "Bolder", text: ("AI Review Gate: " + $s)},
+                  {type: "TextBlock", wrap: true, text: $t}
+                ],
+                actions: [{type: "Action.OpenUrl", title: "Open PR", url: $u}]
+              }
+            }]
+          }')
+          curl -fsS -X POST -H "Content-Type: application/json" -d "$payload" "$TEAMS_WEBHOOK_URL" >/dev/null \
+            || echo "::warning::Teams notification failed"
+
+      - name: Enforce result
+        if: always()
+        env:
+          STATUS: ${{ steps.eval.outputs.status }}
+        run: |
+          if [ "$STATUS" != "PASS" ]; then
+            echo "::error::AI Review Gate failed. See the job summary for reasons."
+            exit 1
+          fi
+          echo "AI Review Gate passed."

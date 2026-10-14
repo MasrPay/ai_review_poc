@@ -1,0 +1,14 @@
+.dart_tool/
+build/
+.DS_Store
+*.log
+# Never commit secrets (also enforced by Policy Checks)
+.env
+.env.*
+!.env.example
+*.pem
+*.p12
+*.jks
+*.keystore
+key.properties
+reports/
