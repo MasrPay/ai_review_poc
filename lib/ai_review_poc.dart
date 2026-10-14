@@ -3,3 +3,4 @@ library;
 
 export 'src/money.dart';
 export 'src/transfer.dart';
+export 'src/fee.dart';
