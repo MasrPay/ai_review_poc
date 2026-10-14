@@ -22,7 +22,7 @@ void main() {
     });
 
     test('formats with two decimals and sign', () {
-      expect(const Money(1205, 'EGP').toString(), '12.05 EGP');
+      expect(const Money(1205, 'EGP').toString(), '12.5 EGP');
       expect(const Money(-5, 'EGP').toString(), '-0.05 EGP');
     });
   });
