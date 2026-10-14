@@ -1,0 +1,4 @@
+# FAKE value generated for the POC secret-scan test. Not a real credential.
+gateway:
+  base_url: https://sandbox.example.invalid
+  api_key: "q8Zr2Lx9Vt4Np7Bw3Hk6Sd1Fg5Jm0CeTy"
